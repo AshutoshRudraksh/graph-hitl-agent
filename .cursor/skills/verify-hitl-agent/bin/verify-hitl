@@ -1,0 +1,298 @@
+#!/usr/bin/env python3
+"""Drive the HITL agent CLI in an isolated PTY and keep the transcript."""
+
+from __future__ import annotations
+
+import json
+import os
+import pty
+import re
+import select
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+SKILL_DIR = Path(__file__).resolve().parents[1]
+REPO = SKILL_DIR.parents[2]
+PYTHON = REPO / ".venv" / "bin" / "python"
+MAIN = REPO / "main.py"
+ARTIFACTS = SKILL_DIR / "artifacts"
+SCRATCH = SKILL_DIR / ".scratch"
+PIDS = SCRATCH / "pids"
+PROMPT = "Approve this transfer? (y/n):"
+FEATURES = {
+    "check-balance": "n",
+    "approve-transfer": "y",
+    "reject-transfer": "n",
+}
+READ_TIMEOUT_S = 20
+
+
+def main() -> int:
+    if len(sys.argv) == 2 and sys.argv[1] == "doctor":
+        return doctor()
+    if len(sys.argv) == 2 and sys.argv[1] == "cleanup":
+        return cleanup()
+    if len(sys.argv) == 3 and sys.argv[1] == "drive" and sys.argv[2] in FEATURES:
+        return drive(sys.argv[2])
+    print(
+        "usage: verify-hitl doctor | verify-hitl drive "
+        "{check-balance|approve-transfer|reject-transfer} | verify-hitl cleanup",
+        file=sys.stderr,
+    )
+    return 2
+
+
+def doctor() -> int:
+    failures: list[str] = []
+    if not PYTHON.is_file():
+        failures.append(f"missing interpreter: {PYTHON}")
+    if not MAIN.is_file():
+        failures.append(f"missing CLI: {MAIN}")
+    version = _project_version()
+    if version is None:
+        failures.append(f"missing version in {REPO / 'pyproject.toml'}")
+    elif not failures:
+        probe = subprocess.run(
+            [str(PYTHON), "-c", "import hitl_agent; print('import-ok')"],
+            cwd=REPO,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if probe.returncode != 0 or "import-ok" not in probe.stdout:
+            detail = (probe.stderr or probe.stdout).strip()
+            failures.append(f"import hitl_agent failed: {detail}")
+    prompt_present = MAIN.is_file() and PROMPT in MAIN.read_text()
+    if MAIN.is_file() and not prompt_present:
+        failures.append(f"main.py does not contain prompt {PROMPT!r}")
+    if failures:
+        print("doctor: fail")
+        for item in failures:
+            print(f"error: {item}")
+        return 1
+    print("doctor: ok")
+    print(f"python: {PYTHON}")
+    print(f"version: {version}")
+    print(f"prompt: {PROMPT}")
+    print(f"repo: {REPO}")
+    return 0
+
+
+def drive(feature: str) -> int:
+    answer = FEATURES[feature]
+    run_id = time.strftime("%Y%m%dT%H%M%S") + f"-{os.getpid()}"
+    out_dir = ARTIFACTS / feature / run_id
+    out_dir.mkdir(parents=True, exist_ok=True)
+    transcript_path = out_dir / "transcript.txt"
+    result_path = out_dir / "result.json"
+    pid_path: Path | None = None
+    proc: subprocess.Popen[bytes] | None = None
+    master: int | None = None
+    exit_code = 1
+    transcript = ""
+    error = ""
+    try:
+        transcript, proc, master, pid_path = _run_cli(answer)
+        exit_code = proc.wait(timeout=5)
+    except Exception as exc:
+        error = str(exc)
+        if proc is not None and proc.poll() is None:
+            proc.kill()
+            exit_code = proc.wait(timeout=5)
+    finally:
+        if master is not None:
+            os.close(master)
+        if pid_path is not None and proc is not None and proc.poll() is not None:
+            pid_path.unlink(missing_ok=True)
+    checks, parsed = _assess(feature, transcript, exit_code)
+    if error:
+        checks.append(error)
+    result = {
+        "feature": feature,
+        "answer": answer,
+        "exit_code": exit_code,
+        "ok": not checks,
+        "checks": checks,
+        **parsed,
+    }
+    transcript_path.write_text(transcript)
+    result_path.write_text(json.dumps(result, indent=2) + "\n")
+    print(f"feature: {feature}")
+    print(f"exit_code: {exit_code}")
+    print(f"ok: {str(result['ok']).lower()}")
+    print(f"transcript: {transcript_path}")
+    print(f"result: {result_path}")
+    return 0 if result["ok"] else 1
+
+
+def cleanup() -> int:
+    if PIDS.is_dir():
+        for pid_file in PIDS.iterdir():
+            _stop_recorded_pid(pid_file)
+    if SCRATCH.exists():
+        shutil.rmtree(SCRATCH)
+    print("cleanup: ok")
+    print(f"artifacts: {ARTIFACTS}")
+    return 0
+
+
+def _run_cli(answer: str) -> tuple[str, subprocess.Popen[bytes], int, Path]:
+    if not PYTHON.is_file():
+        raise RuntimeError(f"missing interpreter: {PYTHON}")
+    PIDS.mkdir(parents=True, exist_ok=True)
+    master, slave = pty.openpty()
+    env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"
+    proc: subprocess.Popen[bytes] | None = None
+    try:
+        proc = subprocess.Popen(
+            [str(PYTHON), str(MAIN)],
+            stdin=slave,
+            stdout=slave,
+            stderr=slave,
+            cwd=REPO,
+            env=env,
+            start_new_session=True,
+        )
+        os.close(slave)
+        slave = -1
+        pid_path = PIDS / str(proc.pid)
+        pid_path.write_text(str(MAIN) + "\n")
+        deadline = time.monotonic() + READ_TIMEOUT_S
+        chunks: list[bytes] = []
+        prompted = False
+        while time.monotonic() < deadline:
+            if proc.poll() is not None and not _pending(master):
+                break
+            readable, _, _ = select.select([master], [], [], 0.2)
+            if not readable:
+                continue
+            try:
+                chunk = os.read(master, 4096)
+            except OSError:
+                break
+            if not chunk:
+                break
+            chunks.append(chunk)
+            if not prompted and PROMPT.encode() in b"".join(chunks):
+                prompted = True
+                os.write(master, f"{answer}\n".encode())
+        if not prompted:
+            raise RuntimeError(f"prompt not seen within {READ_TIMEOUT_S}s")
+        while time.monotonic() < deadline and proc.poll() is None:
+            readable, _, _ = select.select([master], [], [], 0.2)
+            if not readable:
+                continue
+            try:
+                chunk = os.read(master, 4096)
+            except OSError:
+                break
+            if not chunk:
+                break
+            chunks.append(chunk)
+        if proc.poll() is None:
+            raise RuntimeError("CLI did not exit after the approval answer")
+        return b"".join(chunks).decode(errors="replace"), proc, master, pid_path
+    except Exception:
+        if proc is not None and proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=5)
+        if slave >= 0:
+            os.close(slave)
+        os.close(master)
+        raise
+
+
+def _pending(fd: int) -> bool:
+    readable, _, _ = select.select([fd], [], [], 0)
+    return bool(readable)
+
+
+def _assess(feature: str, transcript: str, exit_code: int) -> tuple[list[str], dict]:
+    checks: list[str] = []
+    if exit_code != 0:
+        checks.append(f"CLI exit code {exit_code}, expected 0")
+    if PROMPT not in transcript:
+        checks.append("approval prompt missing from transcript")
+    before, _, after = transcript.partition(PROMPT)
+    keys = re.findall(r'"idempotency_key": "([^"]+)"', transcript)
+    parsed: dict = {
+        "idempotency_keys": keys,
+        "balance_seen": "balance_usd" in before and "usr_9876" in before,
+        "interrupt_seen": "HUMAN_APPROVAL_REQUIRED" in before and "execute_funds_transfer" in before,
+        "paused_before_answer": "paused=True" in before,
+    }
+    if feature == "check-balance":
+        if not parsed["balance_seen"]:
+            checks.append("balance result missing before the prompt")
+        if "SUCCESS" in transcript:
+            checks.append("balance drive executed a transfer")
+        if "cancelled" not in after:
+            checks.append("session did not end on the rejection line")
+    elif feature == "reject-transfer":
+        if not parsed["interrupt_seen"] or "acc_A" not in before or "acc_B" not in before:
+            checks.append("interrupt did not stage acc_A to acc_B before the prompt")
+        if "cancelled" not in after:
+            checks.append("rejection did not cancel the transfer")
+        if "SUCCESS" in transcript:
+            checks.append("rejected transfer still reported SUCCESS")
+    elif feature == "approve-transfer":
+        if not parsed["interrupt_seen"]:
+            checks.append("interrupt missing before the prompt")
+        if '"status": "SUCCESS"' not in after:
+            checks.append("approved transfer did not report SUCCESS after the answer")
+        if "successfully executed" not in after:
+            checks.append("approval completion line missing after the answer")
+        if len(set(keys)) != 1:
+            checks.append(f"expected one idempotency key, saw {keys}")
+        if '"source": "acc_A"' not in after or '"destination": "acc_B"' not in after:
+            checks.append("executed transfer did not use acc_A and acc_B")
+        if '"amount_usd": 500.0' not in after:
+            checks.append("executed amount was not 500.0")
+    return checks, parsed
+
+
+def _stop_recorded_pid(pid_file: Path) -> None:
+    try:
+        pid = int(pid_file.name)
+    except ValueError:
+        return
+    try:
+        command = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "command="],
+            capture_output=True,
+            text=True,
+            check=False,
+        ).stdout
+    except OSError:
+        return
+    if "main.py" not in command or "graph-hitl-agent" not in command:
+        return
+    os.kill(pid, signal.SIGTERM)
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return
+        time.sleep(0.1)
+    os.kill(pid, signal.SIGKILL)
+
+
+def _project_version() -> str | None:
+    path = REPO / "pyproject.toml"
+    if not path.is_file():
+        return None
+    match = re.search(r'(?m)^version = "([^"]+)"', path.read_text())
+    return match.group(1) if match else None
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        raise SystemExit(130)

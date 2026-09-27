@@ -1,0 +1,9 @@
+---
+description: Rules for Cursor AI Agent working on this LangGraph project
+globs: **/*.py
+---
+# Cursor Agent Guidelines
+
+1. **Test-Driven Development**: ALWAYS write or run `pytest` tests for any new node, tool, or graph logic. Never produce code without executable unit/integration tests.
+2. **State Management**: Always use `TypedDict` for `ProductionAgentState` and use `add_messages` reducer for message updates.
+3. **Idempotency**: All side-effecting tools MUST support an `idempotency_key`.
